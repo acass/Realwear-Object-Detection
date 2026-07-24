@@ -3,7 +3,9 @@ package com.crossmedia.objectdetect
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.os.Bundle
 import android.util.Log
 import android.widget.Button
@@ -27,15 +29,49 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "ObjectDetect"
         private const val PERMISSION_REQUEST = 10
+
+        /**
+         * Builds the rotate + centre-crop + scale transform from a [srcW] x [srcH]
+         * camera frame onto a [size] x [size] model input, writing it [into].
+         *
+         * Scaling about the centre by `size / min(rotatedW, rotatedH)` and drawing
+         * onto a square canvas is exactly a centre-crop followed by a scale: the
+         * shorter axis lands flush on the canvas edges, the longer one overflows
+         * and is clipped. Kept separate from the draw so it can be checked without
+         * a camera.
+         */
+        internal fun cropMatrix(srcW: Int, srcH: Int, rotation: Int, size: Int, into: Matrix) {
+            // Rotation permutes the two axes, and min is symmetric, so the shorter
+            // side is the same before and after rotating - no swap needed here.
+            val scale = size.toFloat() / min(srcW, srcH)
+
+            into.reset()
+            into.postTranslate(-srcW / 2f, -srcH / 2f)
+            into.postRotate(rotation.toFloat())
+            into.postScale(scale, scale)
+            into.postTranslate(size / 2f, size / 2f)
+        }
     }
 
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: OverlayView
     private lateinit var pauseButton: Button
+
+    // Confined to analysisExecutor: created there, used there, closed there. The
+    // single thread orders close() after any in-flight detect(), so no frame can
+    // be running against a freed interpreter.
     private var detector: Detector? = null
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var paused = false
-    private var overlaySized = false
+    @Volatile private var overlaySized = false
+
+    // Analysis-thread scratch, allocated once. Reused so a steady-state frame
+    // allocates nothing: see analyze().
+    private var sourceBitmap: Bitmap? = null
+    private var modelBitmap: Bitmap? = null
+    private var modelCanvas: Canvas? = null
+    private val frameMatrix = Matrix()
+    private val framePaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,8 +111,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun startCamera() {
         analysisExecutor.execute {
-            val d = Detector(this)
-            runOnUiThread { detector = d; bindCamera() }
+            // Assigned on the analysis thread that reads it, so the field is never
+            // shared across threads. Only the camera binding needs the UI thread.
+            detector = Detector(this)
+            runOnUiThread { bindCamera() }
         }
     }
 
@@ -105,22 +143,16 @@ class MainActivity : AppCompatActivity() {
             if (paused) return
             val d = detector ?: return
 
-            var bitmap = it.toBitmap()
-            val rotation = it.imageInfo.rotationDegrees
-            if (rotation != 0) {
-                val m = Matrix().apply { postRotate(rotation.toFloat()) }
-                bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
-            }
-
-            // Center-crop to square for the square model input
-            val side = min(bitmap.width, bitmap.height)
-            val square = Bitmap.createBitmap(
-                bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side
-            )
+            val square = prepareFrame(it, d.inputSize)
 
             if (!overlaySized) {
                 overlaySized = true
-                runOnUiThread { sizeOverlay(bitmap.width, bitmap.height) }
+                // Overlay geometry is in rotated frame space, which is what the
+                // preview shows.
+                val rotated = it.imageInfo.rotationDegrees % 180 != 0
+                val w = if (rotated) it.height else it.width
+                val h = if (rotated) it.width else it.height
+                runOnUiThread { sizeOverlay(w, h) }
             }
 
             val start = System.nanoTime()
@@ -130,6 +162,44 @@ class MainActivity : AppCompatActivity() {
 
             runOnUiThread { if (!paused) overlayView.setDetections(detections) }
         }
+    }
+
+    /**
+     * Rotates, centre-crops to square and scales the frame to [size] in a single
+     * draw into a reusable bitmap.
+     *
+     * Doing it as one matrix rather than three chained `Bitmap.createBitmap`
+     * calls is what keeps a steady-state frame allocation-free. Scaling about the
+     * centre by `size / min(rotatedW, rotatedH)` and drawing onto a size x size
+     * canvas is exactly a centre-crop followed by a scale: the shorter axis lands
+     * flush on the canvas and the longer axis overflows and is clipped.
+     */
+    private fun prepareFrame(image: ImageProxy, size: Int): Bitmap {
+        val src = sourceBitmap(image)
+
+        val out = modelBitmap ?: Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            .also { modelBitmap = it; modelCanvas = Canvas(it) }
+
+        cropMatrix(src.width, src.height, image.imageInfo.rotationDegrees, size, frameMatrix)
+        modelCanvas!!.drawBitmap(src, frameMatrix, framePaint)
+        return out
+    }
+
+    /**
+     * The camera frame as a bitmap, reusing one allocation where the plane is
+     * tightly packed. Padded rows are rare but legal, so fall back to CameraX's
+     * own conversion rather than decoding the stride by hand.
+     */
+    private fun sourceBitmap(image: ImageProxy): Bitmap {
+        val plane = image.planes[0]
+        if (plane.rowStride != image.width * 4) return image.toBitmap()
+
+        val reuse = sourceBitmap?.takeIf { it.width == image.width && it.height == image.height }
+            ?: Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                .also { sourceBitmap = it }
+        plane.buffer.rewind()
+        reuse.copyPixelsFromBuffer(plane.buffer)
+        return reuse
     }
 
     /**
@@ -150,7 +220,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // Queue the close behind any frame already running, then stop accepting
+        // work. shutdown() alone does not wait, so closing here would be a
+        // use-after-free on the interpreter's native memory.
+        analysisExecutor.execute {
+            detector?.close()
+            detector = null
+        }
         analysisExecutor.shutdown()
-        detector?.close()
     }
 }

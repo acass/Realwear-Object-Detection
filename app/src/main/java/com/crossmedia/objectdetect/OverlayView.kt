@@ -18,6 +18,8 @@ import kotlin.math.sqrt
  *
  * Each callout is a white ring on the object's center, a 45-degree white leader
  * line, and an opaque white pill carrying the label in black.
+ *
+ * At most [MAX_CALLOUTS] are drawn, strongest first.
  */
 class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
 
@@ -51,9 +53,13 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     private val padX = textSize * 0.6f
     private val padY = textSize * 0.35f
 
-    /** Reused across frames so onDraw does not allocate per invalidate. */
+    /**
+     * Reused across frames. Both stay within their initial capacity, so onDraw
+     * allocates only the label strings.
+     */
     private val visible = Rect()
     private val placed = ArrayList<RectF>(MAX_CALLOUTS)
+    private val strongest = ArrayList<Detection>(MAX_CALLOUTS + 1)
 
     fun setDetections(list: List<Detection>) {
         detections = list
@@ -74,9 +80,11 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         val pillH = (fm.descent - fm.ascent) + padY * 2f
 
         placed.clear()
+        selectStrongest(detections)
 
         // Confidence order: the strongest detection gets first claim on the up-right slot.
-        for (d in detections.sortedByDescending { it.confidence }.take(MAX_CALLOUTS)) {
+        for (i in strongest.indices) {
+            val d = strongest[i]
             val cx = (d.box.left + d.box.right) / 2f * w
             val cy = (d.box.top + d.box.bottom) / 2f * h
 
@@ -85,7 +93,7 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
 
             canvas.drawCircle(cx, cy, ringRadius, chromePaint)
 
-            val pill = fit(cx, cy, pillW, pillH) ?: continue
+            val pill = fit(cx, cy, pillW, pillH, visible, placed) ?: continue
             placed.add(pill)
 
             // Leader ends on the pill corner nearest the anchor.
@@ -100,10 +108,33 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     }
 
     /**
-     * Places the pill in the first quadrant where it lands fully on screen and clear
-     * of pills already placed this frame. Null when all four are blocked.
+     * Fills [strongest] with the top [MAX_CALLOUTS] detections, highest confidence
+     * first, by insertion into a list that never exceeds its initial capacity.
+     * A sort-then-take would allocate a new list on every frame.
      */
-    private fun fit(cx: Float, cy: Float, pillW: Float, pillH: Float): RectF? {
+    internal fun selectStrongest(from: List<Detection>) {
+        strongest.clear()
+        for (i in from.indices) {
+            val d = from[i]
+            var at = 0
+            while (at < strongest.size && strongest[at].confidence >= d.confidence) at++
+            if (at >= MAX_CALLOUTS) continue
+            strongest.add(at, d)
+            if (strongest.size > MAX_CALLOUTS) strongest.removeAt(strongest.size - 1)
+        }
+    }
+
+    internal fun strongestForTest(): List<Detection> = strongest
+
+    /**
+     * Places the pill in the first quadrant where it lands fully inside [visible] and
+     * clear of the pills already [placed] this frame. Null when all four are blocked.
+     * Pure — [visible] and [placed] are passed rather than read from fields so this
+     * can be exercised without driving a real draw pass.
+     */
+    internal fun fit(
+        cx: Float, cy: Float, pillW: Float, pillH: Float, visible: Rect, placed: List<RectF>
+    ): RectF? {
         for ((sx, sy) in QUADRANTS) {
             val endX = cx + leaderRun * sx
             val endY = cy + leaderRun * sy

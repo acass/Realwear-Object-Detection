@@ -25,7 +25,8 @@ class Detector(context: Context) {
         private const val MODEL_FILE = "yolov8n_int8.tflite"
         private const val LABELS_FILE = "labels.txt"
         const val CONFIDENCE_THRESHOLD = 0.5f
-        private const val IOU_THRESHOLD = 0.45f
+        const val IOU_THRESHOLD = 0.45f
+        private const val BENCHMARK_RUNS = 3
     }
 
     private val labels: List<String> =
@@ -38,8 +39,10 @@ class Detector(context: Context) {
                 java.nio.channels.FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength
             )
         }
-    private var interpreter: Interpreter = createInterpreter()
-    private var checkedSpeed = false
+    // Starts on CPU so tensor shapes can be read without committing to a delegate;
+    // the first detect() benchmarks both and keeps the winner. See chooseDelegate().
+    private var interpreter: Interpreter = createCpuInterpreter()
+    private var benchmarked = false
 
     val inputSize: Int
     private val inputType: DataType
@@ -53,6 +56,13 @@ class Detector(context: Context) {
 
     private val inputBuffer: ByteBuffer
     private val pixels: IntArray
+    private val postProcessor: YoloPostProcessor
+
+    // Reused every frame. interpreter.run overwrites outputArray wholesale, and
+    // quantizedOutput is rewound before each run, so neither needs reallocating.
+    private val outputArray: Array<FloatArray>
+    private val outputHolder: Array<Array<FloatArray>>
+    private val quantizedOutput: ByteBuffer?
 
     init {
         val inTensor = interpreter.getInputTensor(0)
@@ -73,25 +83,81 @@ class Detector(context: Context) {
             .order(ByteOrder.nativeOrder())
         pixels = IntArray(inputSize * inputSize)
 
-        Log.i(TAG, "Model loaded: input ${inputSize}x$inputSize $inputType, output ${numChannels}x$numBoxes $outputType")
-    }
+        outputArray = Array(numChannels) { FloatArray(numBoxes) }
+        outputHolder = arrayOf(outputArray)
+        quantizedOutput =
+            if (outputType == DataType.FLOAT32) null
+            else ByteBuffer.allocateDirect(numChannels * numBoxes).order(ByteOrder.nativeOrder())
 
-    // ponytail: NNAPI then CPU; add GPU delegate only if measured FPS is short
-    private fun createInterpreter(): Interpreter {
-        try {
-            val delegate = NnApiDelegate()
-            val interp = Interpreter(modelBuffer, Interpreter.Options().addDelegate(delegate))
-            nnApiDelegate = delegate
-            Log.i(TAG, "Using NNAPI delegate")
-            return interp
-        } catch (e: Exception) {
-            Log.w(TAG, "NNAPI unavailable, falling back to CPU", e)
+        postProcessor = YoloPostProcessor(
+            numChannels, numBoxes, inputSize, labels, CONFIDENCE_THRESHOLD, IOU_THRESHOLD
+        )
+
+        val expectedLabels = numChannels - 4
+        if (labels.size != expectedLabels) {
+            Log.w(TAG, "$LABELS_FILE has ${labels.size} labels but the model has $expectedLabels " +
+                "classes - detections will be mislabelled")
         }
-        return createCpuInterpreter()
+
+        Log.i(TAG, "Model loaded: input ${inputSize}x$inputSize $inputType, output ${numChannels}x$numBoxes $outputType")
     }
 
     private fun createCpuInterpreter(): Interpreter =
         Interpreter(modelBuffer, Interpreter.Options().setNumThreads(4))
+
+    /**
+     * Times CPU against NNAPI on a real frame and keeps whichever is faster.
+     *
+     * Which delegate wins is a property of the device, the driver and the model,
+     * not something a threshold can predict: on a RealWear T21G, NNAPI accepts
+     * this graph and runs it correctly, but XNNPACK on 4 CPU threads is measurably
+     * faster. Measuring costs about a second once, and stays right when the model
+     * or the hardware changes.
+     */
+    private fun chooseDelegate() {
+        val cpuMs = timeInference()
+        val delegate = try {
+            NnApiDelegate()
+        } catch (e: Exception) {
+            Log.w(TAG, "NNAPI unavailable, staying on CPU", e)
+            return
+        }
+
+        val cpuInterpreter = interpreter
+        val nnApiMs = try {
+            interpreter = Interpreter(modelBuffer, Interpreter.Options().addDelegate(delegate))
+            timeInference()
+        } catch (e: Exception) {
+            // A driver can construct and then fail at run time. Never let that
+            // reach the analysis thread - fall back and keep detecting.
+            Log.w(TAG, "NNAPI failed at run time, staying on CPU", e)
+            interpreter = cpuInterpreter
+            delegate.close()
+            return
+        }
+
+        if (nnApiMs < cpuMs) {
+            Log.i(TAG, "Using NNAPI delegate (${nnApiMs}ms vs ${cpuMs}ms on CPU)")
+            nnApiDelegate = delegate
+            cpuInterpreter.close()
+        } else {
+            Log.i(TAG, "Using 4-thread CPU (${cpuMs}ms vs ${nnApiMs}ms on NNAPI)")
+            interpreter.close()
+            delegate.close()
+            interpreter = cpuInterpreter
+        }
+    }
+
+    /** Fastest of [BENCHMARK_RUNS] inferences on the frame already in [inputBuffer]. */
+    private fun timeInference(): Long {
+        var best = Long.MAX_VALUE
+        repeat(BENCHMARK_RUNS) {
+            val start = System.nanoTime()
+            runInference()
+            best = minOf(best, (System.nanoTime() - start) / 1_000_000)
+        }
+        return best
+    }
 
     /** [bitmap] must already be square; it is scaled to the model input size. */
     fun detect(bitmap: Bitmap): List<Detection> {
@@ -114,103 +180,36 @@ class Detector(context: Context) {
             }
         }
 
-        if (!checkedSpeed && nnApiDelegate != null) {
-            checkedSpeed = true
-            val start = System.nanoTime()
-            runInference()
-            val ms = (System.nanoTime() - start) / 1_000_000
-            if (ms > 1500) {
-                // NNAPI driver is a slow software fallback (e.g. emulator); use CPU instead
-                Log.w(TAG, "NNAPI inference took ${ms}ms, switching to CPU")
-                interpreter.close()
-                nnApiDelegate?.close()
-                nnApiDelegate = null
-                interpreter = createCpuInterpreter()
-            }
+        if (!benchmarked) {
+            benchmarked = true
+            chooseDelegate()
         }
-        val raw: Array<FloatArray> = runInference()
-        return postProcess(raw)
+        return postProcessor.process(runInference())
     }
 
     private fun quantize(v: Float): Byte =
         (v / inputScale + inputZeroPoint).toInt().coerceIn(-128, 127).toByte()
 
-    /** Returns output as [numChannels][numBoxes] floats, dequantized if needed. */
+    /**
+     * Returns output as [numChannels][numBoxes] floats, dequantized if needed.
+     * The returned array is [outputArray] and is overwritten on the next call.
+     */
     private fun runInference(): Array<FloatArray> {
         inputBuffer.rewind()
-        val out = Array(numChannels) { FloatArray(numBoxes) }
         if (outputType == DataType.FLOAT32) {
-            val outBuf = arrayOf(out)
-            interpreter.run(inputBuffer, outBuf)
-            return out
+            interpreter.run(inputBuffer, outputHolder)
+            return outputArray
         }
-        val byteOut = ByteBuffer.allocateDirect(numChannels * numBoxes).order(ByteOrder.nativeOrder())
+        val byteOut = quantizedOutput!!
+        byteOut.rewind()
         interpreter.run(inputBuffer, byteOut)
         byteOut.rewind()
         for (c in 0 until numChannels) {
             for (b in 0 until numBoxes) {
-                out[c][b] = (byteOut.get().toInt() - outputZeroPoint) * outputScale
+                outputArray[c][b] = (byteOut.get().toInt() - outputZeroPoint) * outputScale
             }
         }
-        return out
-    }
-
-    private fun postProcess(out: Array<FloatArray>): List<Detection> {
-        val candidates = ArrayList<Detection>()
-        // Ultralytics TFLite exports normalize coords to 0..1; guard for pixel-space models.
-        var coordMax = 0f
-        for (b in 0 until numBoxes) {
-            if (out[2][b] > coordMax) coordMax = out[2][b]
-        }
-        val coordDiv = if (coordMax > 1.5f) inputSize.toFloat() else 1f
-
-        for (b in 0 until numBoxes) {
-            var bestClass = -1
-            var bestScore = 0f
-            for (c in 4 until numChannels) {
-                val s = out[c][b]
-                if (s > bestScore) {
-                    bestScore = s
-                    bestClass = c - 4
-                }
-            }
-            if (bestScore < CONFIDENCE_THRESHOLD) continue
-
-            val cx = out[0][b] / coordDiv
-            val cy = out[1][b] / coordDiv
-            val w = out[2][b] / coordDiv
-            val h = out[3][b] / coordDiv
-            candidates.add(
-                Detection(
-                    RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2),
-                    labels.getOrElse(bestClass) { "class $bestClass" },
-                    bestScore
-                )
-            )
-        }
-        return nms(candidates)
-    }
-
-    private fun nms(detections: List<Detection>): List<Detection> {
-        val sorted = detections.sortedByDescending { it.confidence }.toMutableList()
-        val kept = ArrayList<Detection>()
-        while (sorted.isNotEmpty()) {
-            val best = sorted.removeAt(0)
-            kept.add(best)
-            sorted.removeAll { iou(best.box, it.box) > IOU_THRESHOLD }
-        }
-        return kept
-    }
-
-    private fun iou(a: RectF, b: RectF): Float {
-        val left = maxOf(a.left, b.left)
-        val top = maxOf(a.top, b.top)
-        val right = minOf(a.right, b.right)
-        val bottom = minOf(a.bottom, b.bottom)
-        if (right <= left || bottom <= top) return 0f
-        val inter = (right - left) * (bottom - top)
-        val union = a.width() * a.height() + b.width() * b.height() - inter
-        return if (union <= 0f) 0f else inter / union
+        return outputArray
     }
 
     fun close() {
