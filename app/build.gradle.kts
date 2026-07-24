@@ -27,6 +27,10 @@ android {
     androidResources {
         noCompress += "tflite"
     }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
 }
 
 dependencies {
@@ -40,4 +44,11 @@ dependencies {
     implementation("androidx.camera:camera-view:$camerax")
 
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
+
+    // Robolectric supplies real RectF/Canvas on the desktop JVM, so the detection
+    // geometry is testable without a device. The TFLite interpreter is not — its
+    // natives are Android-only, which is why the decode logic lives in
+    // YoloPostProcessor rather than behind the Interpreter.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }
