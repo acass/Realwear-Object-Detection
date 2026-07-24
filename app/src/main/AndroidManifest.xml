@@ -4,6 +4,19 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 
+    <!--
+        Android 11+ package visibility hides other packages by default, which
+        includes the TTS engine: without this the platform filters out
+        com.realwear.ttsservice and TextToSpeech init returns ERROR. Verified on
+        a T21G, where the log read
+        "AppsFilter: com.crossmedia.objectdetect -> com.realwear.ttsservice BLOCKED".
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <application
         android:label="Object Detection"
         android:theme="@style/Theme.AppCompat.NoActionBar">

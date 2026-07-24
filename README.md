@@ -5,6 +5,10 @@ using YOLOv8 nano running on-device via TensorFlow Lite. Detections are drawn as
 labelled boxes over the live preview, and detection can be paused and resumed by
 voice through RealWear's WearHF system.
 
+It also ships a hands-free [5-step guided procedure](#guided-procedure) for research
+demos: each step names one object to find, the overlay locks onto that object alone,
+and the run ends with a green/red summary of what you found and what the model saw.
+
 Status: verified on RealWear T21G (Navigator 520) hardware, Android 13 / arm64-v8a,
 at roughly 6 frames per second.
 
@@ -23,6 +27,9 @@ CameraX preview  ──>  PreviewView            (what you see)
   TFLite interpreter, input quantization, YOLOv8 output decoding, non-max suppression.
 - **[OverlayView.kt](app/src/main/java/com/crossmedia/objectdetect/OverlayView.kt)** —
   draws the current detections.
+- **[ProcedureState.kt](app/src/main/java/com/crossmedia/objectdetect/ProcedureState.kt)** —
+  the guided procedure's step machine: which object is being looked for, what the
+  operator said about it, what the detector saw.
 
 Frames are analyzed with `STRATEGY_KEEP_ONLY_LATEST`: only the most recent frame is
 ever processed, and frames are dropped rather than queued. The preview keeps rendering
@@ -108,9 +115,50 @@ NMS live in
 rather than behind the interpreter, and why the rotate/crop/scale transform is a pure
 function (`MainActivity.cropMatrix`) separate from the draw that uses it.
 
+`ProcedureState` needs no Robolectric at all — it has no Android imports, which is the
+point of splitting it out of the activity.
+
 Covered: box decode and the pixel-space coordinate guard, confidence thresholding,
-NMS and IoU edge cases, callout placement and quadrant fallback, top-N selection, and
-the crop transform at every camera rotation.
+NMS and IoU edge cases, callout placement and quadrant fallback, top-N selection, the
+crop transform at every camera rotation, and the procedure's step arithmetic —
+advance, undo, the summary transition, and peak-confidence accumulation.
+
+## Guided procedure
+
+A five-step demo script, driven entirely by voice. Say **"Start Procedure"** and the
+app walks you through five COCO objects one at a time:
+
+| Step | COCO class |
+|---|---|
+| 1 | `cup` |
+| 2 | `keyboard` |
+| 3 | `laptop` |
+| 4 | `bottle` |
+| 5 | `cell phone` |
+
+COCO has no "coffee cup" — the class is `cup`. The five are picked for hit rate at
+320x320: no `mouse` or `scissors` (too small to clear a 0.5 threshold), no `book` (weak
+class), no `person` (always in frame). The list is `ProcedureState.DEFAULT_TARGETS`.
+
+Each step shows a banner, speaks the prompt over TTS ("Step one. Look for the cup."),
+and filters the overlay so **only** the target object is drawn. Three commands are live:
+
+| Command | Effect |
+|---|---|
+| **"Good"** | marks the step found, advances |
+| **"Not Found"** | marks the step missing, advances |
+| **"Go Back"** | returns to the previous step and clears its verdict and measurement |
+
+Answering step 5 ends the run at a summary: one row per object, the operator's verdict
+in green or red, and beside it the strongest confidence the detector ever reached for
+that object — or "model never" if it never cleared the threshold. Operator and model
+are recorded separately on purpose; the disagreements are the interesting result.
+Inference is frozen on the summary. **"Restart Procedure"** runs it again,
+**"Exit Procedure"** returns to free-running detection.
+
+Note that at ~6 fps a fast pan can cross a target between frames, so "model never" can
+mean "the model never got a frame of it" rather than "the model failed". That is a
+property of the system, not a bug.
 
 ## Running on RealWear
 
@@ -124,9 +172,47 @@ clears; the preview keeps rendering. The command strings are the button labels i
 [strings.xml](app/src/main/res/values/strings.xml) — changing a label changes the
 command.
 
-Untested on hardware so far. Two things worth checking on a real device before trusting
-it: whether NNAPI on the Navigator's Snapdragon actually beats the CPU path, and
-whether the overlay stays aligned at the device's real preview aspect ratio.
+That mechanism is also why the button bar's visibility is the procedure's grammar:
+only visible buttons become commands, so the Pause button is hidden during a run and
+"Good" / "Not Found" / "Go Back" exist only while a step is open. Visibility is set in
+one place, `MainActivity.applyMode()`.
+
+Verified on hardware for free-running detection: NNAPI loses to 4-thread XNNPACK on the
+T21G, and the overlay stays aligned at the device's real preview aspect ratio.
+
+The guided procedure is verified on a T21G too. WearHF picks up all three step commands
+from the button labels, logging the grammar it built:
+
+```
+... |Select Item 1|GOOD|Select Item 2|NOT FOUND|Select Item 3|GO BACK
+```
+
+"Good" being a single syllable turned out not to be a problem in practice, and WearHF
+adds "Select Item 1/2/3" as positional alternates for every button anyway, so there is
+always a fallback if a phrase is misheard.
+
+### TTS needs a `<queries>` declaration
+
+Android 11+ package visibility hides other packages by default. Without an explicit
+`<queries>` entry the platform filters out the TTS engine and `TextToSpeech` init fails
+with `ERROR`, which on a T21G looks like this:
+
+```
+AppsFilter: com.crossmedia.objectdetect -> com.realwear.ttsservice BLOCKED
+W ObjectDetect: TextToSpeech unavailable (-1), prompts are on-screen only
+```
+
+The fix is in [AndroidManifest.xml](app/src/main/AndroidManifest.xml) — a `<queries>`
+block for `android.intent.action.TTS_SERVICE`, which is what
+`com.realwear.ttsservice/.androidtts.RealWearTextToSpeechService` registers. With it the
+log reads `Connected successfully to TTS engine: com.realwear.ttsservice`.
+
+Speech failure is non-fatal by design: the banner still shows every prompt, so a device
+with no TTS engine degrades to a silent but fully usable procedure.
+
+Still unverified: whether TTS output through the headset speaker can self-trigger
+WearHF's ASR. If a prompt ever fires its own command, all speech goes through
+`MainActivity.speak()` and can be no-op'd in that one place.
 
 ## Vocabulary
 
