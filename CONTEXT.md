@@ -4,10 +4,11 @@ Ubiquitous language for this project. Glossary only — no implementation detail
 
 ## Terms
 
-- **Detection** — one identified object on one frame: a bounding box, a class label, and a confidence score.
+- **Detection** — one identified object on one frame: a bounding box, a class label, a confidence score, and a Mask.
+- **Mask** — the set of pixels a Detection's object actually covers, as opposed to the rectangle enclosing it. Produced by the Model, not inferred from the box. Drawn tinted by Class.
 - **Live detection** — continuous best-effort inference on the camera preview stream. Only the latest frame is ever processed; frames are dropped, never queued.
-- **Overlay** — the boxes and labels drawn over the camera preview representing current detections.
-- **Model** — the swappable detector asset. Currently stock COCO-pretrained YOLOv8 nano; a custom-trained model can replace it without changing the app's meaning.
+- **Overlay** — the Masks and labelled callouts drawn over the camera preview representing current detections.
+- **Model** — the swappable detector asset. Currently stock COCO-pretrained YOLOv8 nano segmentation; a custom-trained model can replace it without changing the app's meaning, provided it also produces Masks.
 - **Class** — one of the object categories the Model can recognize (currently the 80 COCO classes).
 - **Voice command** — a spoken command RealWear's WearHF system derives from a visible control's label (e.g. "Pause Detection"). The app defines controls, not speech handling.
 - **Paused** — detection state where no inference runs and the Overlay is empty; the camera preview keeps rendering.

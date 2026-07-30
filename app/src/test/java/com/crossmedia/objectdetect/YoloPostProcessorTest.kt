@@ -16,11 +16,12 @@ import org.robolectric.annotation.Config
 class YoloPostProcessorTest {
 
     private val labels = listOf("person", "bicycle")
+    private val numClasses = 2
     private val channels = 6   // 4 box + 2 classes
     private val inputSize = 640
 
     private fun processor(boxes: Int, labels: List<String> = this.labels) =
-        YoloPostProcessor(channels, boxes, inputSize, labels, 0.5f, 0.45f)
+        YoloPostProcessor(numClasses, boxes, inputSize, labels, 0.5f, 0.45f)
 
     /** [boxes] is (cx, cy, w, h, score0, score1) per box. */
     private fun tensor(vararg boxes: FloatArray): Array<FloatArray> {
@@ -44,6 +45,85 @@ class YoloPostProcessorTest {
         assertEquals(0.3f, d.box.top, 1e-6f)      // cy - h/2
         assertEquals(0.6f, d.box.right, 1e-6f)
         assertEquals(0.7f, d.box.bottom, 1e-6f)
+    }
+
+    @Test
+    fun `caps at the strongest detections, in descending confidence`() {
+        // Eight disjoint boxes so NMS keeps them all, ascending confidence.
+        val boxes = (1..8).map { i ->
+            floatArrayOf(0.06f * i, 0.5f, 0.05f, 0.05f, 0.5f + 0.05f * i, 0f)
+        }.toTypedArray()
+        val result = processor(8).process(tensor(*boxes), maxDetections = 5)
+
+        assertEquals(5, result.size)
+        val confidences = result.map { it.confidence }
+        assertEquals(0.9f, confidences.first(), 1e-6f)
+        assertTrue("must be descending", confidences.zipWithNext().all { (a, b) -> a >= b })
+    }
+
+    @Test
+    fun `an uncapped call keeps everything NMS kept`() {
+        val boxes = (1..8).map { i ->
+            floatArrayOf(0.06f * i, 0.5f, 0.05f, 0.05f, 0.5f + 0.05f * i, 0f)
+        }.toTypedArray()
+
+        assertEquals(8, processor(8).process(tensor(*boxes)).size)
+    }
+
+    @Test
+    fun `a target filter keeps only that class`() {
+        val out = tensor(
+            floatArrayOf(0.2f, 0.5f, 0.05f, 0.05f, 0.9f, 0.1f),   // person
+            floatArrayOf(0.8f, 0.5f, 0.05f, 0.05f, 0.1f, 0.8f),   // bicycle
+        )
+        val result = processor(2).process(out, targetLabel = "bicycle")
+
+        assertEquals(1, result.size)
+        assertEquals("bicycle", result[0].label)
+    }
+
+    @Test
+    fun `the target survives the cap even when it is not the strongest`() {
+        // Six strong people and one weak bicycle: an unfiltered top-5 would drop
+        // the bicycle, so a procedure step targeting it would show no mask.
+        val boxes = (1..6).map { i ->
+            floatArrayOf(0.06f * i, 0.2f, 0.05f, 0.05f, 0.9f, 0f)
+        } + listOf(floatArrayOf(0.5f, 0.8f, 0.05f, 0.05f, 0f, 0.55f))
+        val result = processor(7).process(
+            tensor(*boxes.toTypedArray()), targetLabel = "bicycle", maxDetections = 5
+        )
+
+        assertEquals(1, result.size)
+        assertEquals("bicycle", result[0].label)
+    }
+
+    @Test
+    fun `ignores channels past the class scores`() {
+        // 4 box + 2 classes + 2 trailing channels, as a segmentation export has:
+        // mask coefficients are unbounded and would win an unguarded argmax.
+        val out = Array(8) { FloatArray(1) }
+        val values = floatArrayOf(0.5f, 0.5f, 0.2f, 0.2f, 0.6f, 0.1f, 9f, -9f)
+        for (c in 0 until 8) out[c][0] = values[c]
+
+        val result = processor(1).process(out)
+
+        assertEquals(1, result.size)
+        assertEquals("person", result[0].label)
+        assertEquals(0, result[0].classId)
+        assertEquals(0.6f, result[0].confidence, 1e-6f)
+    }
+
+    @Test
+    fun `carries class id and box index through to the detection`() {
+        val out = tensor(
+            floatArrayOf(0.5f, 0.5f, 0.2f, 0.2f, 0.1f, 0.1f),   // below threshold, dropped
+            floatArrayOf(0.5f, 0.5f, 0.2f, 0.2f, 0.1f, 0.9f),   // bicycle, tensor column 1
+        )
+        val result = processor(2).process(out)
+
+        assertEquals(1, result.size)
+        assertEquals(1, result[0].classId)
+        assertEquals(1, result[0].boxIndex)
     }
 
     @Test

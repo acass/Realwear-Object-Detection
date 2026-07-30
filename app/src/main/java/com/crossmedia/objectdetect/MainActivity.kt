@@ -213,15 +213,18 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { sizeOverlay(w, h) }
             }
 
-            val start = System.nanoTime()
-            val detections = d.detect(square)
-            val ms = (System.nanoTime() - start) / 1_000_000
-            Log.d(TAG, "Inference ${ms}ms, ${detections.size} detections")
-
-            // Inside a step only the target is drawn, and its strongest hit this
-            // frame goes back into the step's record.
+            // Inside a step only the target is detected, and its strongest hit
+            // this frame goes back into the step's record. The filter runs inside
+            // detect() so masks are synthesized for the target even when it is
+            // not among the strongest detections in a crowded scene.
             val target = targetLabel
-            val shown = if (target == null) detections else detections.filter { det -> det.label == target }
+
+            val start = System.nanoTime()
+            val shown = d.detect(square, target)
+            val ms = (System.nanoTime() - start) / 1_000_000
+            val masks = shown.count { det -> det.mask != null }
+            Log.d(TAG, "Inference ${ms}ms, ${shown.size} detections, $masks masks")
+
             val peak = if (target == null) 0f else shown.maxOfOrNull { det -> det.confidence } ?: 0f
 
             runOnUiThread {

@@ -10,12 +10,16 @@ import android.graphics.RectF
  * natives only — anything sitting behind an `Interpreter` cannot run on the
  * desktop JVM, so the geometry would be untestable in place.
  *
- * [out] is laid out `[numChannels][numBoxes]`: channels 0..3 are cx, cy, w, h
- * and 4.. are per-class scores. Emitted boxes are normalized 0..1 relative to
- * the square model input.
+ * [out] is laid out `[channels][numBoxes]`: channels 0..3 are cx, cy, w, h and
+ * the next [numClasses] are per-class scores. Emitted boxes are normalized 0..1
+ * relative to the square model input.
+ *
+ * Anything after the class scores is ignored - a segmentation export carries 32
+ * mask coefficients there, and they are not class scores however much the argmax
+ * would like them to be.
  */
 class YoloPostProcessor(
-    private val numChannels: Int,
+    private val numClasses: Int,
     private val numBoxes: Int,
     private val inputSize: Int,
     private val labels: List<String>,
@@ -23,7 +27,20 @@ class YoloPostProcessor(
     private val iouThreshold: Float,
 ) {
 
-    fun process(out: Array<FloatArray>): List<Detection> {
+    /**
+     * When [targetLabel] is set only that class survives, and it is applied
+     * before [maxDetections] - a guided procedure's target must keep its place
+     * even in a scene where it is not among the strongest few detections.
+     *
+     * [nms] emits in descending confidence, so the cap is a plain take: the
+     * detections kept are the strongest ones, in the order the overlay wants
+     * them for placement priority.
+     */
+    fun process(
+        out: Array<FloatArray>,
+        targetLabel: String? = null,
+        maxDetections: Int = Int.MAX_VALUE,
+    ): List<Detection> {
         val candidates = ArrayList<Detection>()
         // Ultralytics TFLite exports normalize coords to 0..1; guard for pixel-space models.
         var coordMax = 0f
@@ -35,7 +52,7 @@ class YoloPostProcessor(
         for (b in 0 until numBoxes) {
             var bestClass = -1
             var bestScore = 0f
-            for (c in 4 until numChannels) {
+            for (c in 4 until 4 + numClasses) {
                 val s = out[c][b]
                 if (s > bestScore) {
                     bestScore = s
@@ -52,11 +69,15 @@ class YoloPostProcessor(
                 Detection(
                     RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2),
                     labels.getOrElse(bestClass) { "class $bestClass" },
-                    bestScore
+                    bestScore,
+                    classId = bestClass,
+                    boxIndex = b,
                 )
             )
         }
-        return nms(candidates)
+        var kept = nms(candidates)
+        if (targetLabel != null) kept = kept.filter { it.label == targetLabel }
+        return if (kept.size > maxDetections) kept.subList(0, maxDetections) else kept
     }
 
     internal fun nms(detections: List<Detection>): List<Detection> {

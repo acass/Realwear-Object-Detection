@@ -1,5 +1,6 @@
 package com.crossmedia.objectdetect
 
+import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.RectF
 import org.junit.Assert.assertEquals
@@ -80,32 +81,30 @@ class OverlayViewFitTest {
     }
 
     @Test
-    fun `selects the five strongest detections in descending confidence`() {
-        val input = (1..8).map { Detection(RectF(0f, 0f, 1f, 1f), "d$it", it / 10f) }
-        overlay.selectStrongest(input)
-        val got = overlay.strongestForTest()
-
-        assertEquals(5, got.size)
-        assertEquals(listOf("d8", "d7", "d6", "d5", "d4"), got.map { it.label })
+    fun `each class gets its own colour`() {
+        assertTrue(overlay.colourFor(0) != overlay.colourFor(1))
+        assertTrue(overlay.colourFor(0) != overlay.colourFor(40))
     }
 
     @Test
-    fun `selection handles fewer detections than the cap`() {
-        val input = listOf(
-            Detection(RectF(0f, 0f, 1f, 1f), "low", 0.2f),
-            Detection(RectF(0f, 0f, 1f, 1f), "high", 0.9f),
-        )
-        overlay.selectStrongest(input)
-
-        assertEquals(listOf("high", "low"), overlay.strongestForTest().map { it.label })
+    fun `the same class always gets the same colour`() {
+        assertEquals(overlay.colourFor(17), overlay.colourFor(17))
     }
 
     @Test
-    fun `selection clears state between frames`() {
-        overlay.selectStrongest(listOf(Detection(RectF(0f, 0f, 1f, 1f), "stale", 0.9f)))
-        overlay.selectStrongest(emptyList())
+    fun `masks are translucent so the object stays visible`() {
+        for (id in listOf(0, 1, 79)) {
+            val alpha = Color.alpha(overlay.colourFor(id))
+            assertTrue("class $id alpha $alpha should be translucent", alpha in 1..200)
+        }
+    }
 
-        assertEquals(0, overlay.strongestForTest().size)
+    @Test
+    fun `an out of range or missing class id still yields a colour`() {
+        // A model with more classes than the table, or a detection built without
+        // an id, must not take the overlay down.
+        assertEquals(overlay.colourFor(0), overlay.colourFor(-1))
+        assertEquals(overlay.colourFor(0), overlay.colourFor(80))
     }
 
     @Test

@@ -12,14 +12,18 @@ import android.view.View
 import kotlin.math.sqrt
 
 /**
- * Draws detection callouts over the camera preview. Detections use normalized
- * 0..1 coordinates over the square center-crop of the preview; this view is
- * laid out to exactly cover that crop region, so mapping is a simple scale.
+ * Draws segmentation masks and detection callouts over the camera preview.
+ * Detections use normalized 0..1 coordinates over the square center-crop of the
+ * preview; this view is laid out to exactly cover that crop region, so mapping
+ * is a simple scale.
  *
- * Each callout is a white ring on the object's center, a 45-degree white leader
- * line, and an opaque white pill carrying the label in black.
+ * Each detection gets a translucent mask tinted by its class, and over that a
+ * white ring on the object's center, a 45-degree white leader line, and an
+ * opaque white pill carrying the label in black. Masks go down first so the
+ * chrome stays readable on top of them.
  *
- * At most [MAX_CALLOUTS] are drawn, strongest first.
+ * The detector caps and orders what it hands over - strongest first - so
+ * everything here is drawn.
  */
 class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
 
@@ -50,6 +54,17 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         isFakeBoldText = true
     }
 
+    /**
+     * ALPHA_8 masks carry coverage only, so the paint supplies the colour. Full
+     * saturation and value keep the classes apart on a small display; the alpha
+     * keeps the object underneath visible, which is the whole point of showing
+     * the operator a mask rather than a filled box.
+     */
+    private val maskPaint = Paint().apply { isAntiAlias = false }
+    private val classColours = IntArray(CLASS_COLOURS) { i ->
+        Color.HSVToColor(MASK_ALPHA, floatArrayOf(i * 360f / CLASS_COLOURS, 1f, 1f))
+    }
+
     private val padX = textSize * 0.6f
     private val padY = textSize * 0.35f
 
@@ -58,8 +73,8 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
      * allocates only the label strings.
      */
     private val visible = Rect()
-    private val placed = ArrayList<RectF>(MAX_CALLOUTS)
-    private val strongest = ArrayList<Detection>(MAX_CALLOUTS + 1)
+    private val placed = ArrayList<RectF>(EXPECTED_DETECTIONS)
+    private val maskDst = RectF()
 
     fun setDetections(list: List<Detection>) {
         detections = list
@@ -80,11 +95,21 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         val pillH = (fm.descent - fm.ascent) + padY * 2f
 
         placed.clear()
-        selectStrongest(detections)
+
+        // Masks first, all of them, so no callout ends up under a later mask.
+        for (i in detections.indices) {
+            val mask = detections[i].mask ?: continue
+            maskDst.set(
+                mask.box.left * w, mask.box.top * h,
+                mask.box.right * w, mask.box.bottom * h,
+            )
+            maskPaint.color = colourFor(detections[i].classId)
+            canvas.drawBitmap(mask.bitmap, null, maskDst, maskPaint)
+        }
 
         // Confidence order: the strongest detection gets first claim on the up-right slot.
-        for (i in strongest.indices) {
-            val d = strongest[i]
+        for (i in detections.indices) {
+            val d = detections[i]
             val cx = (d.box.left + d.box.right) / 2f * w
             val cy = (d.box.top + d.box.bottom) / 2f * h
 
@@ -108,23 +133,13 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     }
 
     /**
-     * Fills [strongest] with the top [MAX_CALLOUTS] detections, highest confidence
-     * first, by insertion into a list that never exceeds its initial capacity.
-     * A sort-then-take would allocate a new list on every frame.
+     * Hue by class, so the same class keeps its colour frame to frame and two
+     * overlapping classes read as two objects. Unknown ids fall back to the
+     * first hue rather than crashing on a model whose class count outruns the
+     * table.
      */
-    internal fun selectStrongest(from: List<Detection>) {
-        strongest.clear()
-        for (i in from.indices) {
-            val d = from[i]
-            var at = 0
-            while (at < strongest.size && strongest[at].confidence >= d.confidence) at++
-            if (at >= MAX_CALLOUTS) continue
-            strongest.add(at, d)
-            if (strongest.size > MAX_CALLOUTS) strongest.removeAt(strongest.size - 1)
-        }
-    }
-
-    internal fun strongestForTest(): List<Detection> = strongest
+    internal fun colourFor(classId: Int): Int =
+        classColours[if (classId < 0) 0 else classId % CLASS_COLOURS]
 
     /**
      * Places the pill in the first quadrant where it lands fully inside [visible] and
@@ -158,7 +173,14 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics)
 
     private companion object {
-        const val MAX_CALLOUTS = 5
+        /** Only sizes a reused list - the detector owns the actual cap. */
+        const val EXPECTED_DETECTIONS = 5
+
+        /** COCO's 80 classes, spread evenly around the hue wheel. */
+        const val CLASS_COLOURS = 80
+
+        /** ~35%: enough to read as a silhouette, sheer enough to see through. */
+        const val MASK_ALPHA = 89
 
         // Preference order: up-right, down-right, up-left, down-left.
         val QUADRANTS = arrayOf(
