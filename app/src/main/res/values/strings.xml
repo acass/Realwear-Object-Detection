@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- Button labels double as RealWear WearHF voice commands -->
-    <string name="pause_detection">Pause Detection</string>
-    <string name="resume_detection">Resume Detection</string>
+    <string name="pause_detection">Pause Tracking</string>
+    <string name="resume_detection">Resume Tracking</string>
 </resources>

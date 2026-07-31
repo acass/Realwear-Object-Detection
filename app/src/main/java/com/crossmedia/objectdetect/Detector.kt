@@ -2,7 +2,6 @@ package com.crossmedia.objectdetect
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
@@ -10,27 +9,32 @@ import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-data class Detection(val box: RectF, val label: String, val confidence: Float)
+/**
+ * One detected person: [YoloPostProcessor.KEYPOINT_COUNT] triples of
+ * (x, y, confidence), normalized 0..1 over the square model input.
+ *
+ * Not a data class: the generated equals would compare the keypoint array by
+ * identity, which is a quiet trap for anything doing contains() or distinct().
+ */
+class Pose(val keypoints: FloatArray, val score: Float)
 
 /**
- * Runs YOLOv8 TFLite inference. Handles both float32 and int8-quantized
+ * Runs YOLO pose TFLite inference. Handles both float32 and int8-quantized
  * input/output tensors, since Ultralytics exports vary by flags.
- * Box coordinates in [Detection.box] are normalized 0..1 relative to the
- * square model input.
  */
 class Detector(context: Context) {
 
     companion object {
         private const val TAG = "Detector"
-        private const val MODEL_FILE = "yolov8n_int8.tflite"
-        private const val LABELS_FILE = "labels.txt"
+        private const val MODEL_FILE = "yolo26n_pose_fp32.tflite"
         const val CONFIDENCE_THRESHOLD = 0.5f
         const val IOU_THRESHOLD = 0.45f
+        /** Gates drawing, not decoding: an occluded joint should vanish, not snap to a corner. */
+        const val KEYPOINT_THRESHOLD = 0.5f
         private const val BENCHMARK_RUNS = 3
+        /** ARGB right-shifts in model channel order: R, G, B. */
+        private val RGB_SHIFTS = intArrayOf(16, 8, 0)
     }
-
-    private val labels: List<String> =
-        context.assets.open(LABELS_FILE).bufferedReader().readLines().filter { it.isNotBlank() }
 
     private var nnApiDelegate: NnApiDelegate? = null
     private val modelBuffer: java.nio.MappedByteBuffer =
@@ -45,10 +49,11 @@ class Detector(context: Context) {
     private var benchmarked = false
 
     val inputSize: Int
+    private val channelsFirst: Boolean
     private val inputType: DataType
     private val inputScale: Float
     private val inputZeroPoint: Int
-    private val numChannels: Int   // 84 for COCO (4 box + 80 classes)
+    private val numChannels: Int   // 56 for pose (4 box + 1 person score + 17 keypoint triples)
     private val numBoxes: Int
     private val outputType: DataType
     private val outputScale: Float
@@ -66,12 +71,18 @@ class Detector(context: Context) {
 
     init {
         val inTensor = interpreter.getInputTensor(0)
-        inputSize = inTensor.shape()[1]          // [1, H, W, 3]
+        // Ultralytics' LiteRT exporter keeps PyTorch's [1, 3, H, W]; the older
+        // TensorFlow converter emitted [1, H, W, 3]. Which one you get decides
+        // whether the frame is written planar or interleaved, and getting it
+        // wrong feeds the model scrambled pixels rather than failing loudly.
+        val inShape = inTensor.shape()
+        channelsFirst = inShape[1] == 3
+        inputSize = if (channelsFirst) inShape[2] else inShape[1]
         inputType = inTensor.dataType()
         inputScale = inTensor.quantizationParams().scale
         inputZeroPoint = inTensor.quantizationParams().zeroPoint
 
-        val outTensor = interpreter.getOutputTensor(0)  // [1, 84, N]
+        val outTensor = interpreter.getOutputTensor(0)  // [1, 56, N]
         numChannels = outTensor.shape()[1]
         numBoxes = outTensor.shape()[2]
         outputType = outTensor.dataType()
@@ -90,16 +101,17 @@ class Detector(context: Context) {
             else ByteBuffer.allocateDirect(numChannels * numBoxes).order(ByteOrder.nativeOrder())
 
         postProcessor = YoloPostProcessor(
-            numChannels, numBoxes, inputSize, labels, CONFIDENCE_THRESHOLD, IOU_THRESHOLD
+            numChannels, numBoxes, inputSize, CONFIDENCE_THRESHOLD, IOU_THRESHOLD
         )
 
-        val expectedLabels = numChannels - 4
-        if (labels.size != expectedLabels) {
-            Log.w(TAG, "$LABELS_FILE has ${labels.size} labels but the model has $expectedLabels " +
-                "classes - detections will be mislabelled")
+        val expected = 5 + YoloPostProcessor.KEYPOINT_COUNT * 3
+        if (numChannels != expected) {
+            Log.w(TAG, "$MODEL_FILE has $numChannels channels, expected $expected for a " +
+                "${YoloPostProcessor.KEYPOINT_COUNT}-keypoint pose model - decode will be wrong")
         }
 
-        Log.i(TAG, "Model loaded: input ${inputSize}x$inputSize $inputType, output ${numChannels}x$numBoxes $outputType")
+        val layout = if (channelsFirst) "NCHW" else "NHWC"
+        Log.i(TAG, "Model loaded: input ${inputSize}x$inputSize $inputType $layout, output ${numChannels}x$numBoxes $outputType")
     }
 
     private fun createCpuInterpreter(): Interpreter =
@@ -160,23 +172,19 @@ class Detector(context: Context) {
     }
 
     /** [bitmap] must already be square; it is scaled to the model input size. */
-    fun detect(bitmap: Bitmap): List<Detection> {
+    fun detect(bitmap: Bitmap): List<Pose> {
         val scaled = if (bitmap.width == inputSize && bitmap.height == inputSize) bitmap
         else Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
 
         inputBuffer.rewind()
-        if (inputType == DataType.FLOAT32) {
-            for (p in pixels) {
-                inputBuffer.putFloat(((p shr 16) and 0xFF) / 255f)
-                inputBuffer.putFloat(((p shr 8) and 0xFF) / 255f)
-                inputBuffer.putFloat((p and 0xFF) / 255f)
+        if (channelsFirst) {
+            for (shift in RGB_SHIFTS) {
+                for (p in pixels) putSample(((p shr shift) and 0xFF) / 255f)
             }
         } else {
             for (p in pixels) {
-                inputBuffer.put(quantize(((p shr 16) and 0xFF) / 255f))
-                inputBuffer.put(quantize(((p shr 8) and 0xFF) / 255f))
-                inputBuffer.put(quantize((p and 0xFF) / 255f))
+                for (shift in RGB_SHIFTS) putSample(((p shr shift) and 0xFF) / 255f)
             }
         }
 
@@ -185,6 +193,10 @@ class Detector(context: Context) {
             chooseDelegate()
         }
         return postProcessor.process(runInference())
+    }
+
+    private fun putSample(v: Float) {
+        if (inputType == DataType.FLOAT32) inputBuffer.putFloat(v) else inputBuffer.put(quantize(v))
     }
 
     private fun quantize(v: Float): Byte =

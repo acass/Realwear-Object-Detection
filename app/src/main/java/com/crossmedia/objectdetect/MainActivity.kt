@@ -83,7 +83,7 @@ class MainActivity : AppCompatActivity() {
         pauseButton.setOnClickListener {
             paused = !paused
             pauseButton.setText(if (paused) R.string.resume_detection else R.string.pause_detection)
-            if (paused) overlayView.setDetections(emptyList())
+            if (paused) overlayView.setPoses(emptyList())
         }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -156,11 +156,11 @@ class MainActivity : AppCompatActivity() {
             }
 
             val start = System.nanoTime()
-            val detections = d.detect(square)
+            val poses = d.detect(square)
             val ms = (System.nanoTime() - start) / 1_000_000
-            Log.d(TAG, "Inference ${ms}ms, ${detections.size} detections")
+            Log.d(TAG, "Inference ${ms}ms, ${poses.size} poses")
 
-            runOnUiThread { if (!paused) overlayView.setDetections(detections) }
+            runOnUiThread { if (!paused) overlayView.setPoses(poses) }
         }
     }
 

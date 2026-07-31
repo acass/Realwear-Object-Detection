@@ -1,10 +1,8 @@
 package com.crossmedia.objectdetect
 
-import android.graphics.Rect
-import android.graphics.RectF
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -14,110 +12,79 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 /**
- * Robolectric supplies real RectF/Rect and a display metrics density, so the
- * callout placement geometry runs unmodified on the JVM.
+ * Robolectric supplies a real display metrics density, so the keypoint mapping
+ * runs unmodified on the JVM.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class OverlayViewFitTest {
 
     private lateinit var overlay: OverlayView
-    private val screen = Rect(0, 0, 1000, 1000)
+    private val out = FloatArray(2)
 
     @Before
     fun setUp() {
         overlay = OverlayView(RuntimeEnvironment.getApplication(), null)
     }
 
-    @Test
-    fun `prefers the up-right quadrant when nothing blocks it`() {
-        val pill = overlay.fit(500f, 500f, 100f, 40f, screen, emptyList())
-
-        assertNotNull(pill)
-        assertTrue("pill should sit right of the anchor", pill!!.left > 500f)
-        assertTrue("pill should sit above the anchor", pill.bottom < 500f)
+    /** All 17 keypoints at ([x], [y]) with confidence [conf]. */
+    private fun keypoints(x: Float, y: Float, conf: Float): FloatArray {
+        val k = FloatArray(YoloPostProcessor.KEYPOINT_COUNT * 3)
+        for (i in 0 until YoloPostProcessor.KEYPOINT_COUNT) {
+            k[i * 3] = x; k[i * 3 + 1] = y; k[i * 3 + 2] = conf
+        }
+        return k
     }
 
     @Test
-    fun `falls to another quadrant when up-right leaves the visible rect`() {
-        // Anchor near the top edge: the up-right slot would run off the top.
-        val pill = overlay.fit(500f, 10f, 100f, 40f, screen, emptyList())
+    fun `scales a normalized keypoint to view coordinates`() {
+        assertTrue(overlay.point(keypoints(0.25f, 0.75f, 0.9f), 0, 800f, 400f, out))
 
-        assertNotNull(pill)
-        assertTrue("pill must stay inside the visible rect", pill!!.top >= screen.top)
-        assertTrue(pill.bottom <= screen.bottom)
-        assertTrue(pill.left >= screen.left)
-        assertTrue(pill.right <= screen.right)
+        assertEquals(200f, out[0], 1e-4f)
+        assertEquals(300f, out[1], 1e-4f)
     }
 
     @Test
-    fun `never returns a pill outside the visible rect`() {
-        for (x in listOf(5f, 500f, 995f)) {
-            for (y in listOf(5f, 500f, 995f)) {
-                val pill = overlay.fit(x, y, 100f, 40f, screen, emptyList()) ?: continue
-                assertTrue(
-                    "pill at ($x,$y) escaped: $pill",
-                    pill.left >= screen.left && pill.top >= screen.top &&
-                        pill.right <= screen.right && pill.bottom <= screen.bottom
-                )
-            }
+    fun `maps each keypoint index to its own triple`() {
+        val k = keypoints(0f, 0f, 0.9f)
+        k[16 * 3] = 1f
+        k[16 * 3 + 1] = 0.5f
+
+        assertTrue(overlay.point(k, 16, 100f, 100f, out))
+        assertEquals(100f, out[0], 1e-4f)
+        assertEquals(50f, out[1], 1e-4f)
+    }
+
+    @Test
+    fun `skips a keypoint below the confidence threshold and leaves out untouched`() {
+        val stale = floatArrayOf(-1f, -1f)
+        val below = Detector.KEYPOINT_THRESHOLD - 0.01f
+
+        assertFalse(overlay.point(keypoints(0.5f, 0.5f, below), 0, 100f, 100f, stale))
+        assertArrayEquals(floatArrayOf(-1f, -1f), stale, 1e-6f)
+    }
+
+    @Test
+    fun `draws a keypoint exactly at the threshold`() {
+        assertTrue(
+            overlay.point(keypoints(0.5f, 0.5f, Detector.KEYPOINT_THRESHOLD), 0, 100f, 100f, out)
+        )
+    }
+
+    @Test
+    fun `skeleton is whole pairs of in-range keypoint indices`() {
+        assertEquals(0, OverlayView.SKELETON.size % 2)
+        for (i in OverlayView.SKELETON) {
+            assertTrue("index $i out of range", i in 0 until YoloPostProcessor.KEYPOINT_COUNT)
         }
     }
 
     @Test
-    fun `does not overlap a pill already placed this frame`() {
-        val first = overlay.fit(500f, 500f, 100f, 40f, screen, emptyList())!!
-        val second = overlay.fit(500f, 500f, 100f, 40f, screen, listOf(first))
-
-        assertNotNull(second)
-        assertTrue("second pill overlaps the first", !RectF.intersects(first, second!!))
-    }
-
-    @Test
-    fun `returns null when all four quadrants are blocked`() {
-        // A pill wider than the visible rect cannot land anywhere.
-        assertNull(overlay.fit(500f, 500f, 2000f, 40f, screen, emptyList()))
-    }
-
-    @Test
-    fun `selects the five strongest detections in descending confidence`() {
-        val input = (1..8).map { Detection(RectF(0f, 0f, 1f, 1f), "d$it", it / 10f) }
-        overlay.selectStrongest(input)
-        val got = overlay.strongestForTest()
-
-        assertEquals(5, got.size)
-        assertEquals(listOf("d8", "d7", "d6", "d5", "d4"), got.map { it.label })
-    }
-
-    @Test
-    fun `selection handles fewer detections than the cap`() {
-        val input = listOf(
-            Detection(RectF(0f, 0f, 1f, 1f), "low", 0.2f),
-            Detection(RectF(0f, 0f, 1f, 1f), "high", 0.9f),
-        )
-        overlay.selectStrongest(input)
-
-        assertEquals(listOf("high", "low"), overlay.strongestForTest().map { it.label })
-    }
-
-    @Test
-    fun `selection clears state between frames`() {
-        overlay.selectStrongest(listOf(Detection(RectF(0f, 0f, 1f, 1f), "stale", 0.9f)))
-        overlay.selectStrongest(emptyList())
-
-        assertEquals(0, overlay.strongestForTest().size)
-    }
-
-    @Test
-    fun `clipped visible rect is respected, not the view bounds`() {
-        // Landscape case: the square overlay is taller than the screen, so the
-        // visible band is a horizontal slice.
-        val band = Rect(0, 400, 1000, 600)
-        val pill = overlay.fit(500f, 500f, 100f, 40f, band, emptyList())
-
-        if (pill != null) {
-            assertTrue(pill.top >= band.top)
-            assertTrue(pill.bottom <= band.bottom)
+    fun `skeleton connects every keypoint at least once`() {
+        // A joint no bone reaches would render as a floating dot.
+        val connected = OverlayView.SKELETON.toSet()
+        for (i in 0 until YoloPostProcessor.KEYPOINT_COUNT) {
+            assertTrue("keypoint $i has no bone", i in connected)
         }
     }
 }

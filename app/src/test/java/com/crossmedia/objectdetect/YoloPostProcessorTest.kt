@@ -8,21 +8,33 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * Small synthetic tensors rather than the real 84x8400: the decode is per-box,
- * so 2 classes and a handful of boxes exercise every branch.
+ * Small synthetic tensors rather than the real 56x2100: the decode is per-box,
+ * so a handful of boxes exercises every branch.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class YoloPostProcessorTest {
 
-    private val labels = listOf("person", "bicycle")
-    private val channels = 6   // 4 box + 2 classes
-    private val inputSize = 640
+    private val channels = 5 + YoloPostProcessor.KEYPOINT_COUNT * 3   // 56
+    private val inputSize = 320
 
-    private fun processor(boxes: Int, labels: List<String> = this.labels) =
-        YoloPostProcessor(channels, boxes, inputSize, labels, 0.5f, 0.45f)
+    private fun processor(boxes: Int) =
+        YoloPostProcessor(channels, boxes, inputSize, 0.5f, 0.45f)
 
-    /** [boxes] is (cx, cy, w, h, score0, score1) per box. */
+    /**
+     * One box: cx, cy, w, h, person score, then 17 x (x, y, conf).
+     * Keypoints default to [kpt], which keeps the callers readable when only
+     * the box matters.
+     */
+    private fun box(
+        cx: Float, cy: Float, w: Float, h: Float, score: Float, kpt: FloatArray? = null,
+    ): FloatArray {
+        val values = FloatArray(channels)
+        values[0] = cx; values[1] = cy; values[2] = w; values[3] = h; values[4] = score
+        kpt?.copyInto(values, 5)
+        return values
+    }
+
     private fun tensor(vararg boxes: FloatArray): Array<FloatArray> {
         val out = Array(channels) { FloatArray(boxes.size) }
         boxes.forEachIndexed { b, values ->
@@ -32,94 +44,97 @@ class YoloPostProcessorTest {
     }
 
     @Test
-    fun `decodes a single box to centre-form rect and label`() {
-        val out = tensor(floatArrayOf(0.5f, 0.5f, 0.2f, 0.4f, 0.9f, 0.1f))
-        val result = processor(1).process(out)
+    fun `decodes person score and every keypoint`() {
+        // Keypoint i sits at (i/100, i/50) with confidence 1 - i/100.
+        val kpt = FloatArray(YoloPostProcessor.KEYPOINT_COUNT * 3)
+        for (i in 0 until YoloPostProcessor.KEYPOINT_COUNT) {
+            kpt[i * 3] = i / 100f
+            kpt[i * 3 + 1] = i / 50f
+            kpt[i * 3 + 2] = 1f - i / 100f
+        }
+        val result = processor(1).process(tensor(box(0.5f, 0.5f, 0.2f, 0.4f, 0.9f, kpt)))
 
         assertEquals(1, result.size)
-        val d = result[0]
-        assertEquals("person", d.label)
-        assertEquals(0.9f, d.confidence, 1e-6f)
-        assertEquals(0.4f, d.box.left, 1e-6f)     // cx - w/2
-        assertEquals(0.3f, d.box.top, 1e-6f)      // cy - h/2
-        assertEquals(0.6f, d.box.right, 1e-6f)
-        assertEquals(0.7f, d.box.bottom, 1e-6f)
+        val pose = result[0]
+        assertEquals(0.9f, pose.score, 1e-6f)
+        assertEquals(YoloPostProcessor.KEYPOINT_COUNT * 3, pose.keypoints.size)
+        for (i in 0 until YoloPostProcessor.KEYPOINT_COUNT) {
+            assertEquals(i / 100f, pose.keypoints[i * 3], 1e-6f)
+            assertEquals(i / 50f, pose.keypoints[i * 3 + 1], 1e-6f)
+            assertEquals(1f - i / 100f, pose.keypoints[i * 3 + 2], 1e-6f)
+        }
     }
 
     @Test
-    fun `picks the highest scoring class channel`() {
-        val out = tensor(floatArrayOf(0.5f, 0.5f, 0.2f, 0.2f, 0.6f, 0.8f))
-        val result = processor(1).process(out)
-
-        assertEquals(1, result.size)
-        assertEquals("bicycle", result[0].label)
-        assertEquals(0.8f, result[0].confidence, 1e-6f)
-    }
-
-    @Test
-    fun `drops boxes below the confidence threshold`() {
-        val out = tensor(
-            floatArrayOf(0.5f, 0.5f, 0.2f, 0.2f, 0.49f, 0.1f),   // just under
-            floatArrayOf(0.1f, 0.1f, 0.05f, 0.05f, 0.51f, 0.1f), // just over
+    fun `drops people below the confidence threshold`() {
+        val result = processor(2).process(
+            tensor(
+                box(0.5f, 0.5f, 0.2f, 0.2f, 0.49f),   // just under
+                box(0.1f, 0.1f, 0.05f, 0.05f, 0.51f), // just over
+            )
         )
-        val result = processor(2).process(out)
 
         assertEquals(1, result.size)
-        assertEquals(0.51f, result[0].confidence, 1e-6f)
+        assertEquals(0.51f, result[0].score, 1e-6f)
     }
 
     @Test
-    fun `suppresses an overlapping box and keeps the stronger one`() {
+    fun `suppresses an overlapping person and keeps the stronger one`() {
         // Same 0.4-square shifted by 0.02: IoU well above 0.45.
-        val out = tensor(
-            floatArrayOf(0.50f, 0.50f, 0.4f, 0.4f, 0.7f, 0.0f),
-            floatArrayOf(0.52f, 0.50f, 0.4f, 0.4f, 0.9f, 0.0f),
+        val result = processor(2).process(
+            tensor(
+                box(0.50f, 0.50f, 0.4f, 0.4f, 0.7f),
+                box(0.52f, 0.50f, 0.4f, 0.4f, 0.9f),
+            )
         )
-        val result = processor(2).process(out)
 
         assertEquals(1, result.size)
-        assertEquals(0.9f, result[0].confidence, 1e-6f)
+        assertEquals(0.9f, result[0].score, 1e-6f)
     }
 
     @Test
-    fun `keeps disjoint boxes`() {
-        val out = tensor(
-            floatArrayOf(0.2f, 0.2f, 0.1f, 0.1f, 0.7f, 0.0f),
-            floatArrayOf(0.8f, 0.8f, 0.1f, 0.1f, 0.9f, 0.0f),
+    fun `keeps people who do not overlap`() {
+        val result = processor(2).process(
+            tensor(
+                box(0.2f, 0.2f, 0.1f, 0.1f, 0.7f),
+                box(0.8f, 0.8f, 0.1f, 0.1f, 0.9f),
+            )
         )
-        val result = processor(2).process(out)
 
         assertEquals(2, result.size)
     }
 
     @Test
-    fun `divides by input size when the model emits pixel-space coordinates`() {
-        // w of 128 trips the coordMax > 1.5 guard; everything scales by inputSize.
-        val out = tensor(floatArrayOf(320f, 320f, 128f, 64f, 0.9f, 0.0f))
-        val result = processor(1).process(out)
+    fun `divides keypoints by input size when the model emits pixel-space coordinates`() {
+        // Keypoint 0 at (160, 80) px; the rest stay at the origin.
+        val kpt = FloatArray(YoloPostProcessor.KEYPOINT_COUNT * 3)
+        kpt[0] = 160f; kpt[1] = 80f; kpt[2] = 0.9f
+        val result = processor(1).process(tensor(box(160f, 160f, 64f, 32f, 0.9f, kpt)))
 
         assertEquals(1, result.size)
-        val box = result[0].box
-        assertEquals(0.4f, box.left, 1e-5f)      // (320 - 64) / 640
-        assertEquals(0.45f, box.top, 1e-5f)      // (320 - 32) / 640
-        assertEquals(0.6f, box.right, 1e-5f)
-        assertEquals(0.55f, box.bottom, 1e-5f)
+        val pose = result[0]
+        assertEquals(0.5f, pose.keypoints[0], 1e-5f)    // 160 / 320
+        assertEquals(0.25f, pose.keypoints[1], 1e-5f)   // 80 / 320
+        assertEquals(0.9f, pose.keypoints[2], 1e-6f)    // confidence is not a coordinate
     }
 
     @Test
-    fun `falls back to a synthetic label when the label file is short`() {
-        val out = tensor(floatArrayOf(0.5f, 0.5f, 0.2f, 0.2f, 0.1f, 0.9f))
-        val result = processor(1, labels = listOf("person")).process(out)
+    fun `keeps normalized keypoints when the box is pixel-space`() {
+        // Ultralytics exports have varied on this; the two spaces are guarded
+        // independently so a mixed export still decodes.
+        val kpt = FloatArray(YoloPostProcessor.KEYPOINT_COUNT * 3)
+        kpt[0] = 0.5f; kpt[1] = 0.25f; kpt[2] = 0.9f
+        val result = processor(1).process(tensor(box(160f, 160f, 64f, 32f, 0.9f, kpt)))
 
-        assertEquals(1, result.size)
-        assertEquals("class 1", result[0].label)
+        assertEquals(0.5f, result[0].keypoints[0], 1e-5f)
+        assertEquals(0.25f, result[0].keypoints[1], 1e-5f)
     }
 
     @Test
-    fun `returns nothing when every box is below threshold`() {
+    fun `returns nothing when every person is below threshold`() {
         val out = tensor(
-            floatArrayOf(0.5f, 0.5f, 0.2f, 0.2f, 0.1f, 0.2f),
-            floatArrayOf(0.3f, 0.3f, 0.2f, 0.2f, 0.0f, 0.0f),
+            box(0.5f, 0.5f, 0.2f, 0.2f, 0.1f),
+            box(0.3f, 0.3f, 0.2f, 0.2f, 0.0f),
         )
         assertTrue(processor(2).process(out).isEmpty())
     }

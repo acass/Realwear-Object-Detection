@@ -12,7 +12,10 @@ import org.robolectric.annotation.Config
 @Config(sdk = [33])
 class IouTest {
 
-    private val p = YoloPostProcessor(6, 1, 640, listOf("person"), 0.5f, 0.45f)
+    private val p = YoloPostProcessor(56, 1, 320, 0.5f, 0.45f)
+
+    private fun candidate(box: RectF, score: Float) =
+        YoloPostProcessor.Candidate(box, Pose(FloatArray(YoloPostProcessor.KEYPOINT_COUNT * 3), score))
 
     @Test
     fun `identical boxes overlap completely`() {
@@ -47,15 +50,15 @@ class IouTest {
     @Test
     fun `nms keeps the strongest of a cluster and every isolated box`() {
         val cluster = listOf(
-            Detection(RectF(0f, 0f, 1f, 1f), "a", 0.6f),
-            Detection(RectF(0.05f, 0.05f, 1.05f, 1.05f), "a", 0.9f),
-            Detection(RectF(5f, 5f, 6f, 6f), "b", 0.7f),
+            candidate(RectF(0f, 0f, 1f, 1f), 0.6f),
+            candidate(RectF(0.05f, 0.05f, 1.05f, 1.05f), 0.9f),
+            candidate(RectF(5f, 5f, 6f, 6f), 0.7f),
         )
         val kept = p.nms(cluster)
 
         assertEquals(2, kept.size)
-        assertEquals(0.9f, kept[0].confidence, 1e-6f)
-        assertEquals("b", kept[1].label)
+        assertEquals(0.9f, kept[0].pose.score, 1e-6f)
+        assertEquals(0.7f, kept[1].pose.score, 1e-6f)
     }
 
     @Test

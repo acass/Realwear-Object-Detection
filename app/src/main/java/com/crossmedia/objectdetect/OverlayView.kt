@@ -4,168 +4,98 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Rect
-import android.graphics.RectF
 import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.View
-import kotlin.math.sqrt
 
 /**
- * Draws detection callouts over the camera preview. Detections use normalized
- * 0..1 coordinates over the square center-crop of the preview; this view is
- * laid out to exactly cover that crop region, so mapping is a simple scale.
+ * Draws a skeleton per detected person over the camera preview. Keypoints use
+ * normalized 0..1 coordinates over the square center-crop of the preview; this
+ * view is laid out to exactly cover that crop region, so mapping is a simple
+ * scale.
  *
- * Each callout is a white ring on the object's center, a 45-degree white leader
- * line, and an opaque white pill carrying the label in black.
- *
- * At most [MAX_CALLOUTS] are drawn, strongest first.
+ * A joint below [Detector.KEYPOINT_THRESHOLD] is not drawn, and a bone is drawn
+ * only when both of its ends clear the threshold — an occluded wrist reported at
+ * low confidence would otherwise drag a limb across the display.
  */
 class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
 
-    // Retuning on the headset should only need TEXT_SP; everything else derives from it.
-    private val textSize = sp(32f)
-    private val leaderRun = dp(64f) / sqrt(2f)   // 45 degrees, so dx == dy
-    private val ringRadius = dp(6f)
-    private val strokeWidth = dp(3f)
+    private val jointRadius = dp(5f)
 
-    private var detections: List<Detection> = emptyList()
+    private var poses: List<Pose> = emptyList()
 
-    private val chromePaint = Paint().apply {
+    private val bonePaint = Paint().apply {
         isAntiAlias = true
         style = Paint.Style.STROKE
-        strokeWidth = this@OverlayView.strokeWidth
+        strokeWidth = dp(4f)
+        strokeCap = Paint.Cap.ROUND
         color = Color.WHITE
     }
-    private val pillPaint = Paint().apply {
+    private val jointPaint = Paint().apply {
         isAntiAlias = true
         style = Paint.Style.FILL
-        color = Color.WHITE
-    }
-    private val textPaint = Paint().apply {
-        isAntiAlias = true
-        style = Paint.Style.FILL
-        color = Color.BLACK
-        textSize = this@OverlayView.textSize
-        isFakeBoldText = true
+        color = Color.GREEN
     }
 
-    private val padX = textSize * 0.6f
-    private val padY = textSize * 0.35f
+    // Reused by point() so onDraw stays allocation-free.
+    private val from = FloatArray(2)
+    private val to = FloatArray(2)
 
-    /**
-     * Reused across frames. Both stay within their initial capacity, so onDraw
-     * allocates only the label strings.
-     */
-    private val visible = Rect()
-    private val placed = ArrayList<RectF>(MAX_CALLOUTS)
-    private val strongest = ArrayList<Detection>(MAX_CALLOUTS + 1)
-
-    fun setDetections(list: List<Detection>) {
-        detections = list
+    fun setPoses(list: List<Pose>) {
+        poses = list
         postInvalidateOnAnimation()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        // The overlay square is larger than the screen in landscape, so its top and
-        // bottom are clipped by the parent. Fit against the visible part, not the
-        // view bounds, or pills get placed into the clipped region.
-        if (!getLocalVisibleRect(visible)) return
-
         val w = width.toFloat()
         val h = height.toFloat()
-        val fm = textPaint.fontMetrics
-        val pillH = (fm.descent - fm.ascent) + padY * 2f
 
-        placed.clear()
-        selectStrongest(detections)
+        for (pose in poses) {
+            val k = pose.keypoints
 
-        // Confidence order: the strongest detection gets first claim on the up-right slot.
-        for (i in strongest.indices) {
-            val d = strongest[i]
-            val cx = (d.box.left + d.box.right) / 2f * w
-            val cy = (d.box.top + d.box.bottom) / 2f * h
+            var e = 0
+            while (e < SKELETON.size) {
+                if (point(k, SKELETON[e], w, h, from) && point(k, SKELETON[e + 1], w, h, to)) {
+                    canvas.drawLine(from[0], from[1], to[0], to[1], bonePaint)
+                }
+                e += 2
+            }
 
-            val label = "${d.label} ${(d.confidence * 100).toInt()}%".uppercase()
-            val pillW = textPaint.measureText(label) + padX * 2f
-
-            canvas.drawCircle(cx, cy, ringRadius, chromePaint)
-
-            val pill = fit(cx, cy, pillW, pillH, visible, placed) ?: continue
-            placed.add(pill)
-
-            // Leader ends on the pill corner nearest the anchor.
-            val endX = if (pill.left > cx) pill.left else pill.right
-            val endY = if (pill.top > cy) pill.top else pill.bottom
-            canvas.drawLine(cx, cy, endX, endY, chromePaint)
-
-            val radius = pillH / 2f
-            canvas.drawRoundRect(pill, radius, radius, pillPaint)
-            canvas.drawText(label, pill.left + padX, pill.top + padY - fm.ascent, textPaint)
+            for (i in 0 until YoloPostProcessor.KEYPOINT_COUNT) {
+                if (point(k, i, w, h, from)) {
+                    canvas.drawCircle(from[0], from[1], jointRadius, jointPaint)
+                }
+            }
         }
     }
 
     /**
-     * Fills [strongest] with the top [MAX_CALLOUTS] detections, highest confidence
-     * first, by insertion into a list that never exceeds its initial capacity.
-     * A sort-then-take would allocate a new list on every frame.
+     * Writes keypoint [i] of [keypoints] into [out] as view coordinates, and
+     * reports whether it is confident enough to draw. [out] is left untouched
+     * when it is not.
      */
-    internal fun selectStrongest(from: List<Detection>) {
-        strongest.clear()
-        for (i in from.indices) {
-            val d = from[i]
-            var at = 0
-            while (at < strongest.size && strongest[at].confidence >= d.confidence) at++
-            if (at >= MAX_CALLOUTS) continue
-            strongest.add(at, d)
-            if (strongest.size > MAX_CALLOUTS) strongest.removeAt(strongest.size - 1)
-        }
+    internal fun point(keypoints: FloatArray, i: Int, w: Float, h: Float, out: FloatArray): Boolean {
+        val at = i * 3
+        if (keypoints[at + 2] < Detector.KEYPOINT_THRESHOLD) return false
+        out[0] = keypoints[at] * w
+        out[1] = keypoints[at + 1] * h
+        return true
     }
-
-    internal fun strongestForTest(): List<Detection> = strongest
-
-    /**
-     * Places the pill in the first quadrant where it lands fully inside [visible] and
-     * clear of the pills already [placed] this frame. Null when all four are blocked.
-     * Pure — [visible] and [placed] are passed rather than read from fields so this
-     * can be exercised without driving a real draw pass.
-     */
-    internal fun fit(
-        cx: Float, cy: Float, pillW: Float, pillH: Float, visible: Rect, placed: List<RectF>
-    ): RectF? {
-        for ((sx, sy) in QUADRANTS) {
-            val endX = cx + leaderRun * sx
-            val endY = cy + leaderRun * sy
-            // The leader lands on the pill corner facing the anchor, so the pill
-            // extends away from it on both axes.
-            val left = if (sx > 0) endX else endX - pillW
-            val top = if (sy > 0) endY else endY - pillH
-            val pill = RectF(left, top, left + pillW, top + pillH)
-
-            val onScreen = pill.left >= visible.left && pill.top >= visible.top &&
-                pill.right <= visible.right && pill.bottom <= visible.bottom
-            if (onScreen && placed.none { RectF.intersects(it, pill) }) return pill
-        }
-        return null
-    }
-
-    private fun sp(v: Float) =
-        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, resources.displayMetrics)
 
     private fun dp(v: Float) =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics)
 
-    private companion object {
-        const val MAX_CALLOUTS = 5
-
-        // Preference order: up-right, down-right, up-left, down-left.
-        val QUADRANTS = arrayOf(
-            1f to -1f,
-            1f to 1f,
-            -1f to -1f,
-            -1f to 1f,
+    internal companion object {
+        /**
+         * The standard COCO 17-keypoint skeleton as flat index pairs: legs, hips,
+         * torso, arms, then the face.
+         */
+        val SKELETON = intArrayOf(
+            15, 13, 13, 11, 16, 14, 14, 12, 11, 12,
+            5, 11, 6, 12, 5, 6, 5, 7, 6, 8, 7, 9, 8, 10,
+            1, 2, 0, 1, 0, 2, 1, 3, 2, 4, 3, 5, 4, 6,
         )
     }
 }
