@@ -1,21 +1,41 @@
 # RealWear Object Detection
 
-Real-time object detection on the camera preview of a RealWear head-mounted device,
-using YOLOv8 nano running on-device via TensorFlow Lite. Detections are drawn as
-labelled boxes over the live preview, and detection can be paused and resumed by
-voice through RealWear's WearHF system.
+Real-time object detection with per-object distance on the camera preview of a RealWear
+head-mounted device. YOLOv8 nano detects, YOLO26 nano estimates monocular depth, and each
+callout reads the range to what it labels: `PERSON 2.3M`. Detection can be paused and
+resumed by voice through RealWear's WearHF system.
 
-Status: verified on RealWear T21G (Navigator 520) hardware, Android 13 / arm64-v8a,
-at roughly 6 frames per second.
+Status: verified on RealWear **Navigator 500** (model T21G, Snapdragon 662 / SM6115),
+Android 13 / arm64-v8a. Detection alone runs at roughly 6 fps; detection paired with depth
+runs at roughly 1.8 fps.
+
+**Distances are not yet calibrated.** `DepthSampler` reports what the model says, and the
+model's baked scale was fit at 768 px on Ultralytics' own data, not at 320 px through this
+camera. See [Calibration](#calibration).
 
 ## How it works
 
 ```
-CameraX preview  ──>  PreviewView            (what you see)
+CameraX preview  ──>  PreviewView                      (what you see)
        │
-       └─ ImageAnalysis ──> center-crop square ──> Detector ──> OverlayView
-          (KEEP_ONLY_LATEST)                       (TFLite)     (boxes + labels)
+       └─ ImageAnalysis ──> center-crop 320x320 ──┬──> Detector    ──┐
+          (KEEP_ONLY_LATEST)   (one bitmap)       │    ~120ms        │
+                                                  └──> DepthEstimator┤
+                                                       ~430ms        │
+                                                                     v
+                                                            DepthSampler
+                                                       (median of box centre)
+                                                                     │
+                                                                     v
+                                                              OverlayView
+                                                           (PERSON 2.3M)
 ```
+
+Both models run on the **same** 320x320 bitmap, in sequence, on the one analysis thread.
+That is deliberate: box coordinates come out normalized against exactly that crop, so
+indexing the depth map is a plain multiply with no rescaling and no coordinate bugs. It
+also means position and distance always come from the same instant -- important on a
+head-mounted display, where 700ms of head yaw is a different scene entirely.
 
 - **[MainActivity.kt](app/src/main/java/com/crossmedia/objectdetect/MainActivity.kt)** —
   camera permission, CameraX binding, frame preprocessing, overlay sizing.
@@ -124,9 +144,46 @@ clears; the preview keeps rendering. The command strings are the button labels i
 [strings.xml](app/src/main/res/values/strings.xml) — changing a label changes the
 command.
 
-Untested on hardware so far. Two things worth checking on a real device before trusting
-it: whether NNAPI on the Navigator's Snapdragon actually beats the CPU path, and
-whether the overlay stays aligned at the device's real preview aspect ratio.
+### Delegates
+
+`DelegateRace` times CPU, GPU and NNAPI on the first frame and keeps the fastest, per
+model. Measured on the Navigator 500, best-of-3, inference only:
+
+| model | CPU 4t | GPU | NNAPI | winner |
+|---|---|---|---|---|
+| yolov8n detect @320 | 141 ms | **90 ms** | 196 ms | GPU, 1.6x |
+| yolo26n-depth @320 | 984 ms | **362 ms** | 964 ms | GPU, 2.7x |
+
+The GPU delegate is what makes depth viable at all -- on CPU it costs ~950 ms per frame.
+NNAPI loses on both because this device ships no NNAPI vendor driver: `lshal` lists no
+`neuralnetworks` HAL and `/vendor/lib64/` holds no NNAPI vendor libraries, so it falls
+back to a CPU reference path. `/vendor/lib64/libOpenCL.so` is present, which is why the
+Adreno 610 path works.
+
+Measuring rather than guessing matters here: the same race picks GPU for both models on
+this device, but which delegate wins is a property of the device, the driver and the
+model together, and it changes when any of them does.
+
+## Calibration
+
+The depth head outputs `exp(clamp(logit, -4, 5))` metres, then applies a baked log-affine
+calibration -- in `yolo26n-depth.pt` that is `cal_a = 1.0`, `cal_b = -0.19385`, a x0.8238
+global scale. Ultralytics fit those at imgsz 768 on their pretraining validation mix.
+
+This app runs the graph at 320 through a camera whose field of view RealWear does not
+publish, so that scale does not transfer. `DepthSampler.SCALE_CORRECTION` exists to absorb
+the difference and is **currently 1.0, i.e. uncorrected**.
+
+To calibrate: place a target at 1 m, 2 m and 5 m, read the logged distances, and fit one
+multiplier. If a single multiplier fits all three the residual is pure scale, which is the
+expected failure mode. If it does not, running at 320 has distorted the depth structure
+itself and no scalar will fix it -- that finding would reopen the input-resolution choice.
+
+## Licence note
+
+The Ultralytics models here (`yolov8n_int8.tflite`, `yolo26n-depth.tflite`) are released
+under AGPL-3.0. Ultralytics lists commercial products, proprietary software and embedded
+edge deployments as requiring their Enterprise licence. This is unresolved.
 
 ## Vocabulary
 

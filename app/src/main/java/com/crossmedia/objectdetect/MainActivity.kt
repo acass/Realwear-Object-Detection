@@ -62,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     // be running against a freed interpreter.
     private var detector: Detector? = null
     private var depthEstimator: DepthEstimator? = null
+    private var depthSampler: DepthSampler? = null
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var paused = false
     @Volatile private var overlaySized = false
@@ -166,14 +167,37 @@ class MainActivity : AppCompatActivity() {
             val depthStart = System.nanoTime()
             val depth = depthEstimator?.estimate(square)
             val depthMs = (System.nanoTime() - depthStart) / 1_000_000
+
             val de = depthEstimator
-            val centre = if (depth != null && de != null)
-                depth[(de.outputHeight / 2) * de.outputWidth + de.outputWidth / 2] else 0f
+            var centre: Float? = null
+            val annotated = if (depth != null && de != null) {
+                val s = depthSampler ?: DepthSampler(de.outputWidth, de.outputHeight)
+                    .also { depthSampler = it }
+                // Centre reticle: a small window about the middle of frame, sampled the
+                // same way a box is, so the number the wearer aims with and the number
+                // on a callout mean the same thing.
+                centre = s.sample(depth, 0.45f, 0.45f, 0.55f, 0.55f)
+                detections.map {
+                    it.copy(
+                        distanceMetres = s.sample(
+                            depth, it.box.left, it.box.top, it.box.right, it.box.bottom
+                        )
+                    )
+                }
+            } else detections
 
             Log.d(TAG, "detect ${detectMs}ms + depth ${depthMs}ms = ${detectMs + depthMs}ms, " +
-                "${detections.size} detections, centre ${"%.2f".format(centre)}m")
+                "centre ${centre?.let { "%.2fm".format(it) } ?: "-"}" +
+                annotated.joinToString(prefix = " [", postfix = "]") { det ->
+                    "${det.label} ${det.distanceMetres?.let { "%.2fm".format(it) } ?: "-"}"
+                })
 
-            runOnUiThread { if (!paused) overlayView.setDetections(detections) }
+            runOnUiThread {
+                if (!paused) {
+                    overlayView.setCentreDistance(centre)
+                    overlayView.setDetections(annotated)
+                }
+            }
         }
     }
 

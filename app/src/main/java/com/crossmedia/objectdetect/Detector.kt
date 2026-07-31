@@ -9,7 +9,17 @@ import org.tensorflow.lite.Interpreter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-data class Detection(val box: RectF, val label: String, val confidence: Float)
+/**
+ * @param distanceMetres median depth over the box centre, or null when depth is
+ *   unavailable or out of trusted range. Defaults to null so [YoloPostProcessor], which
+ *   knows nothing about depth, is unchanged.
+ */
+data class Detection(
+    val box: RectF,
+    val label: String,
+    val confidence: Float,
+    val distanceMetres: Float? = null,
+)
 
 /**
  * Runs YOLOv8 TFLite inference. Handles both float32 and int8-quantized

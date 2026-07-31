@@ -57,12 +57,26 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
      * Reused across frames. Both stay within their initial capacity, so onDraw
      * allocates only the label strings.
      */
+    private var centreDistance: Float? = null
     private val visible = Rect()
     private val placed = ArrayList<RectF>(MAX_CALLOUTS)
     private val strongest = ArrayList<Detection>(MAX_CALLOUTS + 1)
 
     fun setDetections(list: List<Detection>) {
         detections = list
+        postInvalidateOnAnimation()
+    }
+
+    /**
+     * Distance at the centre of frame, or null when unavailable.
+     *
+     * Independent of detection: the depth model sees every frame whether or not YOLO
+     * recognises anything, and a wearer aiming at a wall, a pallet or a tape measure
+     * still wants the range. It is also the readout used to fit
+     * [DepthSampler.SCALE_CORRECTION] against a real tape measure.
+     */
+    fun setCentreDistance(metres: Float?) {
+        centreDistance = metres
         postInvalidateOnAnimation()
     }
 
@@ -80,6 +94,7 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         val pillH = (fm.descent - fm.ascent) + padY * 2f
 
         placed.clear()
+        drawCentreReticle(canvas, w, h, fm, pillH)
         selectStrongest(detections)
 
         // Confidence order: the strongest detection gets first claim on the up-right slot.
@@ -88,7 +103,7 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
             val cx = (d.box.left + d.box.right) / 2f * w
             val cy = (d.box.top + d.box.bottom) / 2f * h
 
-            val label = "${d.label} ${(d.confidence * 100).toInt()}%".uppercase()
+            val label = labelFor(d)
             val pillW = textPaint.measureText(label) + padX * 2f
 
             canvas.drawCircle(cx, cy, ringRadius, chromePaint)
@@ -105,6 +120,55 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
             canvas.drawRoundRect(pill, radius, radius, pillPaint)
             canvas.drawText(label, pill.left + padX, pill.top + padY - fm.ascent, textPaint)
         }
+    }
+
+    /**
+     * Crosshair at frame centre with the distance beneath it.
+     *
+     * Drawn before the callouts and its pill is added to [placed], so callout placement
+     * treats it as an obstacle and never overlaps it.
+     */
+    private fun drawCentreReticle(
+        canvas: Canvas,
+        w: Float,
+        h: Float,
+        fm: Paint.FontMetrics,
+        pillH: Float,
+    ) {
+        val metres = centreDistance ?: return
+        val cx = w / 2f
+        val cy = h / 2f
+        val arm = ringRadius * 2f
+
+        canvas.drawLine(cx - arm, cy, cx - ringRadius, cy, chromePaint)
+        canvas.drawLine(cx + ringRadius, cy, cx + arm, cy, chromePaint)
+        canvas.drawLine(cx, cy - arm, cx, cy - ringRadius, chromePaint)
+        canvas.drawLine(cx, cy + ringRadius, cx, cy + arm, chromePaint)
+
+        val text = "%.1fM".format(metres)
+        val pillW = textPaint.measureText(text) + padX * 2f
+        val top = cy + arm + padY
+        val pill = RectF(cx - pillW / 2f, top, cx + pillW / 2f, top + pillH)
+        if (pill.bottom > visible.bottom) return
+
+        val radius = pillH / 2f
+        canvas.drawRoundRect(pill, radius, radius, pillPaint)
+        canvas.drawText(text, pill.left + padX, pill.top + padY - fm.ascent, textPaint)
+        placed.add(pill)
+    }
+
+    /**
+     * Pill text: distance when it is trustworthy, otherwise confidence.
+     *
+     * Confidence is already gated at [Detector.CONFIDENCE_THRESHOLD], so it tells the
+     * wearer little; range is the thing they cannot judge by eye through a monocular
+     * display. Falling back rather than blanking keeps the callout readable when depth
+     * is out of range or unavailable.
+     */
+    internal fun labelFor(d: Detection): String {
+        val value = d.distanceMetres?.let { "%.1fM".format(it) }
+            ?: "${(d.confidence * 100).toInt()}%"
+        return "${d.label} $value".uppercase()
     }
 
     /**
