@@ -61,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     // single thread orders close() after any in-flight detect(), so no frame can
     // be running against a freed interpreter.
     private var detector: Detector? = null
+    private var depthEstimator: DepthEstimator? = null
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var paused = false
     @Volatile private var overlaySized = false
@@ -114,6 +115,7 @@ class MainActivity : AppCompatActivity() {
             // Assigned on the analysis thread that reads it, so the field is never
             // shared across threads. Only the camera binding needs the UI thread.
             detector = Detector(this)
+            depthEstimator = DepthEstimator(this)
             runOnUiThread { bindCamera() }
         }
     }
@@ -157,8 +159,19 @@ class MainActivity : AppCompatActivity() {
 
             val start = System.nanoTime()
             val detections = d.detect(square)
-            val ms = (System.nanoTime() - start) / 1_000_000
-            Log.d(TAG, "Inference ${ms}ms, ${detections.size} detections")
+            val detectMs = (System.nanoTime() - start) / 1_000_000
+
+            // Paired: depth runs on the same square bitmap the detector just saw, so
+            // normalized box coordinates index the depth map with a plain multiply.
+            val depthStart = System.nanoTime()
+            val depth = depthEstimator?.estimate(square)
+            val depthMs = (System.nanoTime() - depthStart) / 1_000_000
+            val de = depthEstimator
+            val centre = if (depth != null && de != null)
+                depth[(de.outputHeight / 2) * de.outputWidth + de.outputWidth / 2] else 0f
+
+            Log.d(TAG, "detect ${detectMs}ms + depth ${depthMs}ms = ${detectMs + depthMs}ms, " +
+                "${detections.size} detections, centre ${"%.2f".format(centre)}m")
 
             runOnUiThread { if (!paused) overlayView.setDetections(detections) }
         }
@@ -225,6 +238,7 @@ class MainActivity : AppCompatActivity() {
         // use-after-free on the interpreter's native memory.
         analysisExecutor.execute {
             detector?.close()
+            depthEstimator?.close()
             detector = null
         }
         analysisExecutor.shutdown()

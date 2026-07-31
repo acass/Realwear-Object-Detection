@@ -6,7 +6,6 @@ import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -32,7 +31,8 @@ class Detector(context: Context) {
     private val labels: List<String> =
         context.assets.open(LABELS_FILE).bufferedReader().readLines().filter { it.isNotBlank() }
 
-    private var nnApiDelegate: NnApiDelegate? = null
+    /** Whichever delegate the race kept, or null if CPU won. */
+    private var delegateHandle: AutoCloseable? = null
     private val modelBuffer: java.nio.MappedByteBuffer =
         context.assets.openFd(MODEL_FILE).use { fd ->
             fd.createInputStream().channel.map(
@@ -40,7 +40,7 @@ class Detector(context: Context) {
             )
         }
     // Starts on CPU so tensor shapes can be read without committing to a delegate;
-    // the first detect() benchmarks both and keeps the winner. See chooseDelegate().
+    // the first detect() races all delegates and keeps the winner. See DelegateRace.
     private var interpreter: Interpreter = createCpuInterpreter()
     private var benchmarked = false
 
@@ -105,55 +105,18 @@ class Detector(context: Context) {
     private fun createCpuInterpreter(): Interpreter =
         Interpreter(modelBuffer, Interpreter.Options().setNumThreads(4))
 
-    /**
-     * Times CPU against NNAPI on a real frame and keeps whichever is faster.
-     *
-     * Which delegate wins is a property of the device, the driver and the model,
-     * not something a threshold can predict: on a RealWear T21G, NNAPI accepts
-     * this graph and runs it correctly, but XNNPACK on 4 CPU threads is measurably
-     * faster. Measuring costs about a second once, and stays right when the model
-     * or the hardware changes.
-     */
     private fun chooseDelegate() {
-        val cpuMs = timeInference()
-        val delegate = try {
-            NnApiDelegate()
-        } catch (e: Exception) {
-            Log.w(TAG, "NNAPI unavailable, staying on CPU", e)
-            return
-        }
-
-        val cpuInterpreter = interpreter
-        val nnApiMs = try {
-            interpreter = Interpreter(modelBuffer, Interpreter.Options().addDelegate(delegate))
-            timeInference()
-        } catch (e: Exception) {
-            // A driver can construct and then fail at run time. Never let that
-            // reach the analysis thread - fall back and keep detecting.
-            Log.w(TAG, "NNAPI failed at run time, staying on CPU", e)
-            interpreter = cpuInterpreter
-            delegate.close()
-            return
-        }
-
-        if (nnApiMs < cpuMs) {
-            Log.i(TAG, "Using NNAPI delegate (${nnApiMs}ms vs ${cpuMs}ms on CPU)")
-            nnApiDelegate = delegate
-            cpuInterpreter.close()
-        } else {
-            Log.i(TAG, "Using 4-thread CPU (${cpuMs}ms vs ${nnApiMs}ms on NNAPI)")
-            interpreter.close()
-            delegate.close()
-            interpreter = cpuInterpreter
-        }
+        val choice = DelegateRace.run(TAG, modelBuffer, interpreter) { timeInference(it) }
+        interpreter = choice.interpreter
+        delegateHandle = choice.delegate
     }
 
     /** Fastest of [BENCHMARK_RUNS] inferences on the frame already in [inputBuffer]. */
-    private fun timeInference(): Long {
+    private fun timeInference(target: Interpreter): Long {
         var best = Long.MAX_VALUE
         repeat(BENCHMARK_RUNS) {
             val start = System.nanoTime()
-            runInference()
+            runInference(target)
             best = minOf(best, (System.nanoTime() - start) / 1_000_000)
         }
         return best
@@ -194,15 +157,15 @@ class Detector(context: Context) {
      * Returns output as [numChannels][numBoxes] floats, dequantized if needed.
      * The returned array is [outputArray] and is overwritten on the next call.
      */
-    private fun runInference(): Array<FloatArray> {
+    private fun runInference(target: Interpreter = interpreter): Array<FloatArray> {
         inputBuffer.rewind()
         if (outputType == DataType.FLOAT32) {
-            interpreter.run(inputBuffer, outputHolder)
+            target.run(inputBuffer, outputHolder)
             return outputArray
         }
         val byteOut = quantizedOutput!!
         byteOut.rewind()
-        interpreter.run(inputBuffer, byteOut)
+        target.run(inputBuffer, byteOut)
         byteOut.rewind()
         for (c in 0 until numChannels) {
             for (b in 0 until numBoxes) {
@@ -214,6 +177,6 @@ class Detector(context: Context) {
 
     fun close() {
         interpreter.close()
-        nnApiDelegate?.close()
+        delegateHandle?.close()
     }
 }

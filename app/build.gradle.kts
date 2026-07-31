@@ -44,6 +44,14 @@ dependencies {
     implementation("androidx.camera:camera-view:$camerax")
 
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    // Adreno 610 on the Navigator's SM6115 exposes /vendor/lib64/libOpenCL.so, and the
+    // device ships no NNAPI vendor driver (lshal lists none), so GPU is the only real
+    // accelerator available. chooseDelegate() races it against CPU at startup.
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
+    // GpuDelegate's constructor references GpuDelegateFactory, which ships in this
+    // separate artifact. Without it the class links only at construction time and
+    // throws NoClassDefFoundError, not an Exception.
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
 
     // Robolectric supplies real RectF/Canvas on the desktop JVM, so the detection
     // geometry is testable without a device. The TFLite interpreter is not — its
